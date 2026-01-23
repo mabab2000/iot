@@ -96,7 +96,7 @@ async def receive_data(data: AlcoholData):
 
 @app.get("/data")
 async def get_data():
-    """Return the most recent alcohol reading from the database."""
+    """Return all alcohol readings from the database (most recent first)."""
     if engine is None:
         raise HTTPException(status_code=500, detail="Database engine not initialized")
 
@@ -105,13 +105,21 @@ async def get_data():
         alcohol_table.c.alcohol,
         alcohol_table.c.detected,
         alcohol_table.c.created_at,
-    ).order_by(alcohol_table.c.created_at.desc()).limit(1)
+    ).order_by(alcohol_table.c.created_at.desc())
 
     async with engine.connect() as conn:
         result = await conn.execute(sel)
-        row = result.first()
+        rows = result.fetchall()
 
-    if not row:
-        return {"alcohol": 0, "detected": False}
+    if not rows:
+        return []
 
-    return {"id": row.id, "alcohol": row.alcohol, "detected": row.detected, "created_at": row.created_at}
+    return [
+        {
+            "id": r.id,
+            "alcohol": r.alcohol,
+            "detected": r.detected,
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]
