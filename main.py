@@ -1,8 +1,7 @@
 import os
-from typing import Optional, Any
-import asyncio
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -18,7 +17,10 @@ from sqlalchemy import (
     TIMESTAMP,
     func,
     select,
+    Text,
+    String,
 )
+import sqlalchemy
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 
 load_dotenv()
@@ -56,6 +58,16 @@ alcohol_table = Table(
     Column("created_at", TIMESTAMP(timezone=True), server_default=func.now(), nullable=False),
 )
 
+# Store analysis requests/results
+analysis_table = Table(
+    "analysis",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("text", Text, nullable=False),
+    Column("result", String(16), nullable=False),
+    Column("created_at", TIMESTAMP(timezone=True), server_default=func.now(), nullable=False),
+)
+
 engine: Optional[AsyncEngine] = None
 
 
@@ -64,35 +76,9 @@ class AlcoholData(BaseModel):
     detected: bool
 
 
+
 class TextRequest(BaseModel):
     text: str
-
-
-# WebSocket connection management
-_ws_connections: set[WebSocket] = set()
-_ws_lock = asyncio.Lock()
-
-
-async def broadcast(message: Any) -> None:
-    """Send `message` (JSON-serializable) to all connected websockets.
-
-    Removes connections that are closed or raise on send.
-    """
-    to_remove = []
-    async with _ws_lock:
-        conns = list(_ws_connections)
-
-    for ws in conns:
-        try:
-            await ws.send_json(message)
-        except Exception:
-            to_remove.append(ws)
-
-    if to_remove:
-        async with _ws_lock:
-            for ws in to_remove:
-                _ws_connections.discard(ws)
-
 
 
 @app.on_event("startup")
@@ -104,8 +90,11 @@ async def startup():
         echo=False,
         connect_args={"statement_cache_size": 0},
     )
-    # create tables if not exists
+    # Drop and recreate analysis table if it exists with wrong column types
     async with engine.begin() as conn:
+        # Drop analysis table if it exists (to fix column type mismatch)
+        await conn.execute(sqlalchemy.text("DROP TABLE IF EXISTS analysis CASCADE;"))
+        # create tables if not exists
         await conn.run_sync(metadata.create_all)
 
 
@@ -209,33 +198,56 @@ async def analyze_text(payload: TextRequest):
         else:
             result = "OFF"
 
-    # notify websocket clients about the analysis result as JSON {"result":"OFF"}
-    await broadcast({"result": result})
+    # persist analysis to database (update existing row or insert if none exists)
+    if engine is None:
+        raise HTTPException(status_code=500, detail="Database engine not initialized")
+
+    async with engine.begin() as conn:
+        # Check if any row exists
+        check_stmt = select(analysis_table.c.id).limit(1)
+        existing = await conn.execute(check_stmt)
+        row = existing.first()
+        
+        if row:
+            # Update existing row
+            update_stmt = analysis_table.update().values(
+                text=payload.text, 
+                result=result,
+                created_at=func.now()
+            ).where(analysis_table.c.id == row.id)
+            await conn.execute(update_stmt)
+        else:
+            # Insert new row if none exists
+            insert_stmt = analysis_table.insert().values(text=payload.text, result=result)
+            await conn.execute(insert_stmt)
 
     return {"status": "success", "result": result}
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint that keeps client connections open and receives optional pings.
+@app.get("/analysis")
+async def get_analysis():
+    """Return all analysis records (most recent first)."""
+    if engine is None:
+        raise HTTPException(status_code=500, detail="Database engine not initialized")
 
-    Clients should connect to `ws://<host>/ws`. When an analysis happens, server will
-    push JSON messages like {"type":"analyze","result":"ON","text":"..."}.
-    """
-    await websocket.accept()
-    async with _ws_lock:
-        _ws_connections.add(websocket)
+    sel = select(
+        analysis_table.c.id,
+        analysis_table.c.text,
+        analysis_table.c.result,
+        analysis_table.c.created_at,
+    ).order_by(analysis_table.c.created_at.desc())
 
-    try:
-        while True:
-            # keep connection alive by waiting for incoming messages (clients may send pings)
-            try:
-                await websocket.receive_text()
-            except WebSocketDisconnect:
-                break
-            except Exception:
-                # ignore other receive errors and continue listening
-                await asyncio.sleep(0.1)
-    finally:
-        async with _ws_lock:
-            _ws_connections.discard(websocket)
+    async with engine.connect() as conn:
+        result = await conn.execute(sel)
+        rows = result.fetchall()
+
+    if not rows:
+        return []
+
+    return [
+        {"id": r.id, "text": r.text, "result": r.result, "created_at": r.created_at}
+        for r in rows
+    ]
+
+
+
