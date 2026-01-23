@@ -64,7 +64,12 @@ class AlcoholData(BaseModel):
 @app.on_event("startup")
 async def startup():
     global engine
-    engine = create_async_engine(ASYNC_DATABASE_URL, echo=False)
+    # Disable asyncpg prepared statement cache for pgbouncer compatibility
+    engine = create_async_engine(
+        ASYNC_DATABASE_URL,
+        echo=False,
+        connect_args={"statement_cache_size": 0},
+    )
     # create tables if not exists
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
