@@ -156,9 +156,8 @@ async def analyze_text(payload: TextRequest):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set in environment")
 
     system_prompt = (
-        "You are a classifier. Given an instruction or text, respond with exactly one word: ON or OFF. "
-        "Return ON when the text requests or implies turning something on (e.g., 'turn on the LED', 'please enable the light'). "
-        "Return OFF otherwise. Respond with only the single word ON or OFF and nothing else."
+        "You are a classifier. Given an instruction or text, respond with exactly one of these four tokens and nothing else:\n"
+        "FAN ON\nFAN OFF\nLED ON\nLED OFF"
     )
 
     messages = [
@@ -171,7 +170,7 @@ async def analyze_text(payload: TextRequest):
             resp = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
-                json={"model": "gpt-3.5-turbo", "messages": messages, "max_tokens": 3, "temperature": 0.0},
+                json={"model": "gpt-3.5-turbo", "messages": messages, "max_tokens": 6, "temperature": 0.0},
             )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"OpenAI request failed: {e}")
@@ -186,17 +185,40 @@ async def analyze_text(payload: TextRequest):
         raise HTTPException(status_code=502, detail="Unexpected response from OpenAI")
 
     text = text.strip().upper()
-    # Extract ON or OFF from the response
-    m = re.search(r"\b(ON|OFF)\b", text)
+    # Prefer explicit full-token matches: "FAN ON", "FAN OFF", "LED ON", "LED OFF"
+    m = re.search(r"\b(FAN ON|FAN OFF|LED ON|LED OFF)\b", text)
     if m:
         result = m.group(1)
     else:
-        # fallback heuristic based on user text
+        # If model returned an option-string like "1.FAN ON;FAN OFF" or "2.LED ON ;LED OFF",
+        # pick the ON or OFF option based on the user's intent heuristic.
+        opt_match = re.search(r"(FAN\s+ON\s*;\s*FAN\s+OFF|LED\s+ON\s*;\s*LED\s+OFF)", text)
         lower = payload.text.lower()
-        if any(k in lower for k in ("turn on", "please on", "switch on", "enable", "start")):
-            result = "ON"
+        prefer_on = any(k in lower for k in ("turn on", "please on", "switch on", "enable", "start"))
+        if opt_match:
+            opts = re.split(r"\s*;\s*", opt_match.group(0))
+            # choose the option containing ON when user intent prefers ON, else OFF
+            if prefer_on:
+                pick = next((p for p in opts if "ON" in p), opts[0])
+            else:
+                pick = next((p for p in opts if "OFF" in p), opts[0])
+            result = pick.strip()
         else:
-            result = "OFF"
+            # Final fallback: infer device and state from user text
+            device = None
+            if "fan" in lower:
+                device = "FAN"
+            elif any(k in lower for k in ("led", "light", "bulb", "lamp")):
+                device = "LED"
+
+            if device:
+                if prefer_on:
+                    result = f"{device} ON"
+                else:
+                    result = f"{device} OFF"
+            else:
+                # As a last resort, default to "FAN OFF"
+                result = "FAN OFF"
 
     # persist analysis to database (update existing row or insert if none exists)
     if engine is None:
