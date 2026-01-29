@@ -156,8 +156,8 @@ async def analyze_text(payload: TextRequest):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set in environment")
 
     system_prompt = (
-        "You are a classifier. Given an instruction or text, respond with exactly one of these four tokens and nothing else:\n"
-        "FAN ON\nFAN OFF\nLED ON\nLED OFF"
+        "You are a classifier. Given an instruction or text, respond with exactly one of these tokens and nothing else:\n"
+        "ONLY FAN ON\nONLY LED ON\nBOTH ON\nBOTH OFF"
     )
 
     messages = [
@@ -185,40 +185,89 @@ async def analyze_text(payload: TextRequest):
         raise HTTPException(status_code=502, detail="Unexpected response from OpenAI")
 
     text = text.strip().upper()
-    # Prefer explicit full-token matches: "FAN ON", "FAN OFF", "LED ON", "LED OFF"
-    m = re.search(r"\b(FAN ON|FAN OFF|LED ON|LED OFF)\b", text)
-    if m:
-        result = m.group(1)
-    else:
-        # If model returned an option-string like "1.FAN ON;FAN OFF" or "2.LED ON ;LED OFF",
-        # pick the ON or OFF option based on the user's intent heuristic.
-        opt_match = re.search(r"(FAN\s+ON\s*;\s*FAN\s+OFF|LED\s+ON\s*;\s*LED\s+OFF)", text)
-        lower = payload.text.lower()
-        prefer_on = any(k in lower for k in ("turn on", "please on", "switch on", "enable", "start"))
-        if opt_match:
-            opts = re.split(r"\s*;\s*", opt_match.group(0))
-            # choose the option containing ON when user intent prefers ON, else OFF
-            if prefer_on:
-                pick = next((p for p in opts if "ON" in p), opts[0])
-            else:
-                pick = next((p for p in opts if "OFF" in p), opts[0])
-            result = pick.strip()
-        else:
-            # Final fallback: infer device and state from user text
-            device = None
-            if "fan" in lower:
-                device = "FAN"
-            elif any(k in lower for k in ("led", "light", "bulb", "lamp")):
-                device = "LED"
 
-            if device:
-                if prefer_on:
-                    result = f"{device} ON"
-                else:
-                    result = f"{device} OFF"
+    # Canonical tokens — we will always return exactly one of these
+    CANONICAL = [
+        "ONLY FAN ON",
+        "ONLY LED ON",
+        "BOTH ON",
+        "BOTH OFF",
+    ]
+
+    # Helper to map various token forms into one of the canonical tokens
+    def to_canonical(token: str, prefer_on: bool, lower_user: str) -> str:
+        t = token.strip().upper()
+        if "BOTH" in t:
+            return "BOTH ON" if prefer_on else "BOTH OFF"
+        if "FAN" in t and "LED" in t:
+            return "BOTH ON" if prefer_on else "BOTH OFF"
+        if "FAN" in t:
+            return "ONLY FAN ON" if "ON" in t or prefer_on else "ONLY FAN ON" if "ONLY" in t else ("ONLY FAN OFF" if not prefer_on else "ONLY FAN ON")
+        if "LED" in t:
+            # prefer ONLY LED when user mentions "only"
+            if "ONLY" in t or "ONLY" in lower_user or "just" in lower_user:
+                return "ONLY LED ON" if prefer_on else "ONLY LED ON" if "ONLY" in t and "OFF" not in t else "ONLY LED ON" if prefer_on else "ONLY LED ON"
+            return "ONLY LED ON" if prefer_on else "ONLY LED ON"
+        # Default fallback
+        return "ONLY FAN ON" if prefer_on else "BOTH OFF"
+
+    # Build a relaxed token list to search for (allow common variants)
+    VARIANTS = [
+        "ONLY FAN ON",
+        "ONLY FAN OFF",
+        "FAN ON",
+        "FAN OFF",
+        "ONLY LED ON",
+        "ONLY LED OFF",
+        "LED ON",
+        "LED OFF",
+        "BOTH ON",
+        "BOTH OFF",
+    ]
+
+    token_regex = r"\b(" + "|".join(re.escape(t) for t in VARIANTS) + r")\b"
+    m = re.search(token_regex, text)
+    lower = payload.text.lower()
+    prefer_on = any(k in lower for k in ("turn on", "please on", "switch on", "enable", "start"))
+
+    if m:
+        result = to_canonical(m.group(1), prefer_on, lower)
+    else:
+        # Look for any canonical or variant tokens inside model text
+        found = None
+        for v in VARIANTS + CANONICAL:
+            if v in text:
+                found = v
+                break
+
+        if found:
+            result = to_canonical(found, prefer_on, lower)
+        else:
+            # Split on common separators and try to map parts
+            parts = re.split(r"[;,/\\\n]", text)
+            pick = None
+            for p in (pp.strip() for pp in parts if pp.strip()):
+                for v in VARIANTS + CANONICAL:
+                    if v in p or all(w in p for w in v.split()):
+                        pick = v
+                        break
+                if pick:
+                    break
+
+            if pick:
+                result = to_canonical(pick, prefer_on, lower)
             else:
-                # As a last resort, default to "FAN OFF"
-                result = "FAN OFF"
+                # Infer from user text: if both mentioned -> BOTH, else ONLY FAN or ONLY LED
+                has_fan = "fan" in lower
+                has_led = any(k in lower for k in ("led", "light", "bulb", "lamp"))
+                if has_fan and has_led:
+                    result = "BOTH ON" if prefer_on else "BOTH OFF"
+                elif has_led:
+                    result = "ONLY LED ON" if prefer_on else "ONLY LED ON"
+                elif has_fan:
+                    result = "ONLY FAN ON" if prefer_on else "ONLY FAN ON"
+                else:
+                    result = "BOTH OFF"
 
     # persist analysis to database (update existing row or insert if none exists)
     if engine is None:
@@ -266,8 +315,27 @@ async def get_analysis():
     if not rows:
         return []
 
+    def option_for(result: str) -> dict:
+        r = (result or "").upper().strip()
+        if r == "ONLY FAN ON":
+            return {"FAN": "ON", "LED": "OFF"}
+        if r == "ONLY LED ON":
+            return {"FAN": "OFF", "LED": "ON"}
+        if r == "BOTH ON":
+            return {"FAN": "ON", "LED": "ON"}
+        if r == "BOTH OFF":
+            return {"FAN": "OFF", "LED": "OFF"}
+        # safe default
+        return {"FAN": "OFF", "LED": "OFF"}
+
     return [
-        {"id": r.id, "text": r.text, "result": r.result, "created_at": r.created_at}
+        {
+            "id": r.id,
+            "text": r.text,
+            "result": r.result,
+            "option": option_for(r.result),
+            "created_at": r.created_at,
+        }
         for r in rows
     ]
 
